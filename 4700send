@@ -43,12 +43,12 @@ class Sender:
     def run(self):
         #MUST ADD WRAPPING AROUND LATER?
         seq = random.randint(0, 100)
-
-        window = 5
+        pseudo_window = 0
+        window = 4
         while True:
             sockets = [self.socket, sys.stdin] if window > 0 else [self.socket]
 
-            socks = select.select(sockets, [], [], 0.1)[0]
+            socks = select.select(sockets, [], [])[0]
             for conn in socks:
                 if conn == self.socket:
                     data = self.recv(conn)
@@ -56,13 +56,16 @@ class Sender:
                     if data:
                         # self.waiting = False
                         if data['seq'] == seq:
-                            window += 1
+                            window += 1 + pseudo_window
+                            pseudo_window = 0
+                        else: 
+                            pseudo_window += 1
                 elif conn == sys.stdin:
                     data = sys.stdin.read(DATA_SIZE)
                     if len(data) == 0:
                         self.log("All done!")
                         sys.exit(0)
-
+                    self.log(f"{window}")
                     msg = { "type": "msg", "data": data, "seq": seq }
                     self.send(msg)
                     # self.waiting = True
