@@ -39,6 +39,7 @@ class Receiver:
     def run(self):
         firstSequence = True
         sequence = 0
+        window = []
         while True:
             socks = select.select([self.socket], [], [])[0]
             for conn in socks:
@@ -52,13 +53,31 @@ class Receiver:
                         print(msg["data"], end='', flush=True)
                     else:
                         if sequence == msg["seq"]:
-                            print(msg["data"], end='', flush=True)
-                            sequence += len(msg["data"])
+                            if len(window) != 0:
+                                sequence = self.checkWindow(window, msg, sequence)
+                            else: 
+                                print(msg["data"], end='', flush=True)
+                                sequence += len(msg["data"])
+                        else:
+                            window.append(msg)
+                            window = sorted(window, key=lambda x: x["seq"])
                     # Always send back an ack
                     self.send({ "type": "ack", "seq": sequence })
 
 
         return
+
+    def checkWindow(self, window, msg, sequence):
+        sequence += len(msg["data"])
+        response = msg["data"]
+        for packet in window:
+            if packet["seq"] == sequence: 
+                sequence += len(packet["data"])
+                response += packet["data"]
+        print(response, end='', flush=True)
+        return sequence
+            
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='receive data')

@@ -44,7 +44,7 @@ class Sender:
         #MUST ADD WRAPPING AROUND LATER?
         seq = random.randint(0, 100)
 
-        window = 2
+        window = 5
         while True:
             sockets = [self.socket, sys.stdin] if window > 0 else [self.socket]
 
