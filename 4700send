@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, random
 
 DATA_SIZE = 1375
 
@@ -41,7 +41,9 @@ class Sender:
             return json.loads(data.decode("utf-8"))
 
     def run(self):
-        seq = 0
+        #MUST ADD WRAPPING AROUND LATER?
+        seq = random.randint(0, 100)
+
         window = 2
         while True:
             sockets = [self.socket, sys.stdin] if window > 0 else [self.socket]
@@ -53,7 +55,8 @@ class Sender:
 
                     if data:
                         # self.waiting = False
-                        window += 1
+                        if data['seq'] == seq:
+                            window += 1
                 elif conn == sys.stdin:
                     data = sys.stdin.read(DATA_SIZE)
                     if len(data) == 0:
@@ -63,7 +66,7 @@ class Sender:
                     msg = { "type": "msg", "data": data, "seq": seq }
                     self.send(msg)
                     # self.waiting = True
-                    seq += 1
+                    seq += len(data)
                     window -= 1
 
         return
