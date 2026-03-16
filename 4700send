@@ -42,8 +42,9 @@ class Sender:
 
     def run(self):
         seq = 0
+        window = 2
         while True:
-            sockets = [self.socket, sys.stdin] if not self.waiting else [self.socket]
+            sockets = [self.socket, sys.stdin] if window > 0 else [self.socket]
 
             socks = select.select(sockets, [], [], 0.1)[0]
             for conn in socks:
@@ -51,7 +52,8 @@ class Sender:
                     data = self.recv(conn)
 
                     if data:
-                        self.waiting = False
+                        # self.waiting = False
+                        window += 1
                 elif conn == sys.stdin:
                     data = sys.stdin.read(DATA_SIZE)
                     if len(data) == 0:
@@ -60,8 +62,9 @@ class Sender:
 
                     msg = { "type": "msg", "data": data, "seq": seq }
                     self.send(msg)
-                    self.waiting = True
+                    # self.waiting = True
                     seq += 1
+                    window -= 1
 
         return
 
