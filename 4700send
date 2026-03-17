@@ -15,7 +15,7 @@ def checksum(data):
 class Sender:
     def __init__(self, host, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.02)
+        self.sock.settimeout(0.05)
         self.addr = (host, int(port))
 
     def send(self, msg):
@@ -41,18 +41,18 @@ class Sender:
             chunks.append(data[i:i + CHUNK_SIZE])
             i += CHUNK_SIZE
 
-        send_buffer = {}
-        send_time = {}
+        send_buffer = {}   # seq -> packet
+        send_time = {}     # seq -> last send time
 
         base = 0
         next_seq = 0
 
         window_size = 4
-        timeout = 0.30
+        max_window = 10
+        timeout = 0.25
 
         last_ack = -1
         dup_ack_count = 0
-        ack_progress = 0
 
         while base < total_data:
             # Fill window
@@ -70,10 +70,9 @@ class Sender:
                 self.send(pkt)
                 send_buffer[next_seq] = pkt
                 send_time[next_seq] = time.time()
-
                 next_seq += len(payload)
 
-            # Drain queued ACKs
+            # Handle as many ACKs as are immediately available
             while True:
                 msg = self.recv()
                 if msg is None:
@@ -86,57 +85,53 @@ class Sender:
 
                 ack = msg["seq"]
 
+                if not isinstance(ack, int):
+                    continue
                 if checksum(str(ack)) != msg["checksum"]:
                     continue
-
                 if ack < base or ack > next_seq:
                     continue
 
                 if ack > base:
-                    newly_acked = ack - base
+                    old_base = base
                     base = ack
 
+                    # remove acknowledged packets
                     for s in list(send_buffer.keys()):
                         if s < ack:
                             del send_buffer[s]
                             del send_time[s]
 
-                    # reset dup ack state
+                    # additive increase: grow slowly
+                    window_size = min(max_window, window_size + 1)
+
                     last_ack = ack
                     dup_ack_count = 0
 
-                    # slower additive increase
-                    ack_progress += newly_acked
-                    if ack_progress >= window_size * CHUNK_SIZE:
-                        window_size += 1
-                        ack_progress = 0
-
-                elif ack == base:
+                else:  # ack == base
                     if ack == last_ack:
                         dup_ack_count += 1
                     else:
                         last_ack = ack
                         dup_ack_count = 1
 
-                    # fast retransmit
+                    # fast retransmit after 3 duplicate ACKs
                     if dup_ack_count >= 3 and base in send_buffer:
                         self.send(send_buffer[base])
                         send_time[base] = time.time()
-                        window_size = max(2, window_size - 1)
+                        window_size = max(1, window_size // 2)
                         dup_ack_count = 0
 
-            # timeout retransmit oldest unacked only
-            if base < next_seq and base in send_time:
+            # Timeout: retransmit oldest unacked packet
+            if base < next_seq and base in send_buffer:
                 now = time.time()
-                if now - send_time[base] > timeout:
+                if now - send_time[base] >= timeout:
                     self.send(send_buffer[base])
                     send_time[base] = now
                     window_size = max(1, window_size // 2)
-                    ack_progress = 0
                     dup_ack_count = 0
 
-            # tighter cap for low-bandwidth stability
-            window_size = min(window_size, 12)
+        return
 
 
 if __name__ == "__main__":
