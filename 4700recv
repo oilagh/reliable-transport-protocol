@@ -23,8 +23,6 @@ class Receiver:
         self.remote_port = None
 
     def send(self, message):
-        if self.remote_host is None or self.remote_port is None:
-            return
         self.log("Sent message %s" % json.dumps(message))
         self.socket.sendto(
             json.dumps(message).encode("utf-8"),
@@ -45,7 +43,7 @@ class Receiver:
         try:
             msg = json.loads(data.decode("utf-8"))
         except Exception:
-            self.log("Corrupted JSON → dropping")
+            self.log("Corrupted JSON -> dropping")
             return None
 
         self.log("Received message %s" % msg)
@@ -56,13 +54,13 @@ class Receiver:
         sys.stderr.flush()
 
     def run(self):
-        sequence = 0
-        buffer = {}
+        sequence = 0          # next expected byte
+        buffer = {}           # seq -> payload
 
         while True:
-            readable = select.select([self.socket], [], [])[0]
+            socks = select.select([self.socket], [], [])[0]
 
-            for conn in readable:
+            for conn in socks:
                 msg = self.recv(conn)
 
                 if not isinstance(msg, dict):
@@ -72,7 +70,7 @@ class Receiver:
                     continue
 
                 if "seq" not in msg or "data" not in msg or "checksum" not in msg:
-                    self.log("Malformed packet → dropping")
+                    self.log("Malformed packet -> dropping")
                     continue
 
                 seq = msg["seq"]
@@ -80,11 +78,11 @@ class Receiver:
                 pkt_checksum = msg["checksum"]
 
                 if not isinstance(seq, int) or not isinstance(data, str) or not isinstance(pkt_checksum, str):
-                    self.log("Malformed packet → dropping")
+                    self.log("Malformed packet -> dropping")
                     continue
 
                 if checksum(data) != pkt_checksum:
-                    self.log("Corrupted packet → dropping")
+                    self.log("Corrupted packet -> dropping")
                     continue
 
                 if seq < sequence:
@@ -99,9 +97,8 @@ class Receiver:
                     buffer[seq] = data
 
                 while sequence in buffer:
-                    payload = buffer[sequence]
+                    payload = buffer.pop(sequence)
                     print(payload, end="", flush=True)
-                    del buffer[sequence]
                     sequence += len(payload)
 
                 self.send({
@@ -113,6 +110,7 @@ class Receiver:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="receive data")
-    args = parser.parse_args()
+    parser.parse_args()
+
     receiver = Receiver()
     receiver.run()
