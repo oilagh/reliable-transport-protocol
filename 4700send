@@ -11,28 +11,33 @@ CHUNK_SIZE = 1000
 def checksum(data):
     return hashlib.md5(data.encode()).hexdigest()
 
+
 class Sender:
     def __init__(self, host, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.1)
+        self.sock.settimeout(0.05)
         self.addr = (host, int(port))
 
     def send(self, msg):
-        self.sock.sendto(json.dumps(msg).encode(), self.addr)
+        self.sock.sendto(json.dumps(msg).encode("utf-8"), self.addr)
 
     def recv(self):
         try:
             data, _ = self.sock.recvfrom(65535)
-            return json.loads(data.decode())
-        except:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
             return None
 
     def run(self):
         data = sys.stdin.read()
+        total_data = len(data)
+
+        if total_data == 0:
+            return
 
         chunks = []
         i = 0
-        while i < len(data):
+        while i < total_data:
             chunks.append(data[i:i + CHUNK_SIZE])
             i += CHUNK_SIZE
 
@@ -41,13 +46,17 @@ class Sender:
 
         base = 0
         next_seq = 0
-        window_size = 4
-        timeout = 1.0
-        total_data = len(data)
 
-        while True:
-            # Send packets while window has room
-            while (next_seq - base) < window_size * CHUNK_SIZE and next_seq < total_data:
+        window_size = 4
+        timeout = 0.3
+
+        # for gentler additive increase
+        ack_counter = 0
+
+        while base < total_data:
+            # Fill window
+            in_flight = next_seq - base
+            while in_flight < window_size * CHUNK_SIZE and next_seq < total_data:
                 chunk_index = next_seq // CHUNK_SIZE
                 payload = chunks[chunk_index]
 
@@ -63,50 +72,49 @@ class Sender:
                 send_time[next_seq] = time.time()
 
                 next_seq += len(payload)
+                in_flight = next_seq - base
 
-            # Receive and validate ACK
+            # Process one ACK if available
             msg = self.recv()
-            if msg is not None:
-                if msg.get("type") == "ack" and "seq" in msg and "checksum" in msg:
+            if isinstance(msg, dict) and msg.get("type") == "ack":
+                if "seq" in msg and "checksum" in msg:
                     ack = msg["seq"]
+                    ack_checksum = msg["checksum"]
 
-                    # Reject corrupted ACKs
-                    if checksum(str(ack)) == msg["checksum"]:
-                        # Reject impossible / stale / future ACKs
-                        if base <= ack <= next_seq:
-                            if ack > base:
-                                # Remove acknowledged packets
-                                for s in list(send_buffer):
-                                    if s < ack:
-                                        del send_buffer[s]
-                                        del send_time[s]
+                    if isinstance(ack, int) and isinstance(ack_checksum, str):
+                        # validate ACK checksum
+                        if checksum(str(ack)) == ack_checksum:
+                            # only accept cumulative ACKs within current sent range
+                            if base <= ack <= next_seq:
+                                if ack > base:
+                                    old_base = base
+                                    base = ack
 
-                                # Congestion control: additive increase
-                                newly_acked = ack - base
-                                base = ack
+                                    # remove all acknowledged packets
+                                    for s in list(send_buffer.keys()):
+                                        if s < ack:
+                                            del send_buffer[s]
+                                            del send_time[s]
 
-                                # Increase slowly to avoid overfilling low-bandwidth links
-                                if newly_acked > 0:
-                                    window_size += 1
+                                    # additive increase: much slower
+                                    ack_counter += 1
+                                    if ack_counter >= window_size:
+                                        window_size += 1
+                                        ack_counter = 0
 
-            # Timeout-based retransmission + congestion backoff
-            now = time.time()
-            timeout_happened = False
+            # Timeout: retransmit oldest unacked only
+            if base < next_seq and base in send_time:
+                now = time.time()
+                if now - send_time[base] > timeout:
+                    self.send(send_buffer[base])
+                    send_time[base] = now
 
-            for s in list(send_buffer):
-                if now - send_time[s] > timeout:
-                    self.send(send_buffer[s])
-                    send_time[s] = now
-                    timeout_happened = True
+                    # multiplicative decrease
+                    window_size = max(1, window_size // 2)
+                    ack_counter = 0
 
-            if timeout_happened:
-                window_size = max(1, window_size // 2)
-
-            # Prevent runaway growth
-            window_size = min(window_size, 50)
-
-            if base >= total_data:
-                break
+            # prevent runaway window growth
+            window_size = min(window_size, 20)
 
 
 if __name__ == "__main__":
