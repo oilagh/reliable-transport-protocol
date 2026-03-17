@@ -1,73 +1,51 @@
 #!/usr/bin/env -S python3 -u
 
-import socket
-import time
-import json
-import sys
-import hashlib
+import socket, time, json, sys, hashlib
 
 CHUNK_SIZE = 1000
-
 
 def checksum(data):
     return hashlib.md5(data.encode()).hexdigest()
 
-
 class Sender:
     def __init__(self, host, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.01)
+        self.sock.settimeout(0.05)
         self.addr = (host, int(port))
 
     def send(self, msg):
-        self.sock.sendto(json.dumps(msg).encode("utf-8"), self.addr)
+        self.sock.sendto(json.dumps(msg).encode(), self.addr)
 
     def recv(self):
         try:
             data, _ = self.sock.recvfrom(65535)
-            return json.loads(data.decode("utf-8"))
-        except Exception:
+            return json.loads(data.decode())
+        except:
             return None
 
     def run(self):
         data = sys.stdin.read()
-        total_data = len(data)
-
-        if total_data == 0:
-            return
 
         chunks = []
         i = 0
-        while i < total_data:
-            chunks.append(data[i:i + CHUNK_SIZE])
+        while i < len(data):
+            chunks.append(data[i:i+CHUNK_SIZE])
             i += CHUNK_SIZE
 
-        send_buffer = {}   # seq -> packet
-        send_time = {}     # seq -> send timestamp
+        send_buffer = {}
+        send_time = {}
 
         base = 0
         next_seq = 0
+        window_size = 5   # slightly bigger than before
+        timeout = 0.4     # key: better for jitter
 
-        # TCP Reno style congestion control
-        cwnd = 4.0              # in packets
-        ssthresh = 8.0
-        max_cwnd = 32.0
+        total_data = len(data)
 
-        last_ack = -1
-        dup_ack_count = 0
+        while True:
 
-        # Adaptive timeout (RTO)
-        estimated_rtt = 0.25
-        dev_rtt = 0.05
-        rto = 0.35
-
-        while base < total_data:
-            window_bytes = int(cwnd) * CHUNK_SIZE
-            if window_bytes < CHUNK_SIZE:
-                window_bytes = CHUNK_SIZE
-
-            # Fill window
-            while next_seq < total_data and (next_seq - base) < window_bytes:
+            # Send within window
+            while (next_seq - base) < window_size * CHUNK_SIZE and next_seq < total_data:
                 chunk_index = next_seq // CHUNK_SIZE
                 payload = chunks[chunk_index]
 
@@ -81,87 +59,35 @@ class Sender:
                 self.send(pkt)
                 send_buffer[next_seq] = pkt
                 send_time[next_seq] = time.time()
+
                 next_seq += len(payload)
 
-            got_ack = False
+            # Receive ACK
+            msg = self.recv()
+            if msg and msg.get("type") == "ack":
+                if "seq" in msg and "checksum" in msg:
+                    ack = msg["seq"]
 
-            # Drain available ACKs
-            while True:
-                msg = self.recv()
-                if msg is None:
-                    break
+                    # validate ACK
+                    if checksum(str(ack)) == msg["checksum"]:
+                        if base <= ack <= next_seq:
+                            # remove acknowledged packets
+                            for s in list(send_buffer):
+                                if s < ack:
+                                    del send_buffer[s]
+                                    del send_time[s]
 
-                if msg.get("type") != "ack":
-                    continue
-                if "seq" not in msg or "checksum" not in msg:
-                    continue
+                            base = ack
 
-                ack = msg["seq"]
+            # Retransmit ALL timed-out packets (IMPORTANT)
+            now = time.time()
+            for s in list(send_buffer):
+                if now - send_time[s] > timeout:
+                    self.send(send_buffer[s])
+                    send_time[s] = now
 
-                if not isinstance(ack, int):
-                    continue
-                if checksum(str(ack)) != msg["checksum"]:
-                    continue
-                if ack < base or ack > next_seq:
-                    continue
-
-                got_ack = True
-
-                if ack > base:
-                    # Sample RTT using the packet at old base if still present
-                    if base in send_time:
-                        sample_rtt = time.time() - send_time[base]
-                        estimated_rtt = 0.875 * estimated_rtt + 0.125 * sample_rtt
-                        dev_rtt = 0.75 * dev_rtt + 0.25 * abs(sample_rtt - estimated_rtt)
-                        rto = estimated_rtt + 4 * dev_rtt
-                        rto = max(0.15, min(rto, 1.0))
-
-                    # Remove all cumulatively ACKed packets
-                    for s in list(send_buffer.keys()):
-                        if s < ack:
-                            del send_buffer[s]
-                            del send_time[s]
-
-                    base = ack
-                    dup_ack_count = 0
-                    last_ack = ack
-
-                    # Congestion control
-                    if cwnd < ssthresh:
-                        # slow start
-                        cwnd = min(max_cwnd, cwnd + 1.0)
-                    else:
-                        # congestion avoidance
-                        cwnd = min(max_cwnd, cwnd + (1.0 / cwnd))
-
-                elif ack == base:
-                    if ack == last_ack:
-                        dup_ack_count += 1
-                    else:
-                        last_ack = ack
-                        dup_ack_count = 1
-
-                    # Fast retransmit
-                    if dup_ack_count >= 3 and base in send_buffer:
-                        ssthresh = max(2.0, cwnd / 2.0)
-                        cwnd = max(1.0, ssthresh)
-                        self.send(send_buffer[base])
-                        send_time[base] = time.time()
-                        dup_ack_count = 0
-
-            # Timeout retransmission: only retransmit oldest unacked packet
-            if base in send_buffer:
-                now = time.time()
-                if now - send_time[base] >= rto:
-                    ssthresh = max(2.0, cwnd / 2.0)
-                    cwnd = 1.0
-                    dup_ack_count = 0
-                    self.send(send_buffer[base])
-                    send_time[base] = now
-
-            # Tiny pause prevents hot spinning when network is stressed
-            if not got_ack:
-                time.sleep(0.001)
+            if base >= total_data:
+                break
 
 
 if __name__ == "__main__":
