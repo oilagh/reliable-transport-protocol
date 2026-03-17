@@ -1,6 +1,10 @@
 #!/usr/bin/env -S python3 -u
 
-import socket, time, json, sys, hashlib
+import socket
+import time
+import json
+import sys
+import hashlib
 
 CHUNK_SIZE = 1000
 
@@ -26,26 +30,23 @@ class Sender:
     def run(self):
         data = sys.stdin.read()
 
-        # Split into chunks
         chunks = []
         i = 0
         while i < len(data):
-            chunks.append(data[i:i+CHUNK_SIZE])
+            chunks.append(data[i:i + CHUNK_SIZE])
             i += CHUNK_SIZE
 
-        send_buffer = {}
-        send_time = {}
+        send_buffer = {}   # seq -> packet
+        send_time = {}     # seq -> last send time
 
         base = 0
         next_seq = 0
         window_size = 4
         timeout = 1.0
-
         total_data = len(data)
 
         while True:
-
-            # Send packets within window
+            # Send packets while window has room
             while (next_seq - base) < window_size * CHUNK_SIZE and next_seq < total_data:
                 chunk_index = next_seq // CHUNK_SIZE
                 payload = chunks[chunk_index]
@@ -58,36 +59,52 @@ class Sender:
                 }
 
                 self.send(pkt)
-
                 send_buffer[next_seq] = pkt
                 send_time[next_seq] = time.time()
 
                 next_seq += len(payload)
 
-            # Receive ACK
+            # Receive and validate ACK
             msg = self.recv()
-            if msg and msg.get("type") == "ack" and "seq" in msg:
-                ack = msg["seq"]
+            if msg is not None:
+                if msg.get("type") == "ack" and "seq" in msg and "checksum" in msg:
+                    ack = msg["seq"]
 
-                to_remove = []
-                for s in list(send_buffer):
-                    if s < ack:
-                        to_remove.append(s)
+                    # Reject corrupted ACKs
+                    if checksum(str(ack)) == msg["checksum"]:
+                        # Reject impossible / stale / future ACKs
+                        if base <= ack <= next_seq:
+                            if ack > base:
+                                # Remove acknowledged packets
+                                for s in list(send_buffer):
+                                    if s < ack:
+                                        del send_buffer[s]
+                                        del send_time[s]
 
-                for s in to_remove:
-                    del send_buffer[s]
-                    del send_time[s]
+                                # Congestion control: additive increase
+                                newly_acked = ack - base
+                                base = ack
 
-                base = ack
+                                # Increase slowly to avoid overfilling low-bandwidth links
+                                if newly_acked > 0:
+                                    window_size += 1
 
-            # Retransmit on timeout
+            # Timeout-based retransmission + congestion backoff
             now = time.time()
+            timeout_happened = False
+
             for s in list(send_buffer):
                 if now - send_time[s] > timeout:
                     self.send(send_buffer[s])
                     send_time[s] = now
+                    timeout_happened = True
 
-            # Exit condition
+            if timeout_happened:
+                window_size = max(1, window_size // 2)
+
+            # Prevent runaway growth
+            window_size = min(window_size, 50)
+
             if base >= total_data:
                 break
 
@@ -95,5 +112,4 @@ class Sender:
 if __name__ == "__main__":
     host = sys.argv[1]
     port = sys.argv[2]
-
     Sender(host, port).run()
