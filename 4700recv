@@ -1,6 +1,9 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, hashlib
+
+def checksum(data):
+    return hashlib.md5(data.encode()).hexdigest()
 
 class Receiver:
     def __init__(self):
@@ -19,64 +22,66 @@ class Receiver:
     def recv(self, socket):
         data, addr = socket.recvfrom(65535)
 
-        # Grab the remote host/port if we don't already have it
         if self.remote_host is None:
             self.remote_host = addr[0]
             self.remote_port = addr[1]
 
-        # Make sure we're talking to the same remote host
         if addr != (self.remote_host, self.remote_port):
-            self.log("Error:  Received response from unexpected remote; ignoring")
+            self.log("Error: Received response from unexpected remote; ignoring")
             return None
-        else:
-            self.log("Received message %s" % data.decode("utf-8"))
-            return json.loads(data.decode("utf-8"))
+
+        # FIX: safe JSON parsing
+        try:
+            msg = json.loads(data.decode("utf-8"))
+        except:
+            self.log("Corrupted JSON → dropping")
+            return None
+
+        self.log("Received message %s" % msg)
+        return msg
 
     def log(self, message):
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
     def run(self):
-        firstSequence = True
-        sequence = 0
-        window = []
+        sequence = 0              # next expected byte
+        buffer = {}              # seq -> packet data
+
         while True:
             socks = select.select([self.socket], [], [])[0]
             for conn in socks:
                 msg = self.recv(conn)
 
-                if msg:
-                    if firstSequence:
-                        firstSequence = False                        
-                        sequence = msg["seq"]
-                        sequence += len(msg["data"])
-                        print(msg["data"], end='', flush=True)
-                    else:
-                        if sequence == msg["seq"]:
-                            if len(window) != 0:
-                                sequence = self.checkWindow(window, msg, sequence)
-                            else: 
-                                print(msg["data"], end='', flush=True)
-                                sequence += len(msg["data"])
-                        else:
-                            window.append(msg)
-                            window = sorted(window, key=lambda x: x["seq"])
-                    # Always send back an ack
+                if not msg or msg.get("type") != "msg":
+                    continue
+
+                seq = msg["seq"]
+                data = msg["data"]
+
+                # FIX: checksum validation
+                if "checksum" not in msg or checksum(data) != msg["checksum"]:
+                    self.log("Corrupted packet → dropping")
+                    continue
+
+                # FIX: duplicate packet
+                if seq < sequence:
                     self.send({ "type": "ack", "seq": sequence })
+                    continue
 
+                # FIX: store packet if new
+                if seq not in buffer:
+                    buffer[seq] = data
 
-        return
+                # FIX: deliver in-order data
+                while sequence in buffer:
+                    payload = buffer[sequence]
+                    print(payload, end='', flush=True)
+                    del buffer[sequence]
+                    sequence += len(payload)
 
-    def checkWindow(self, window, msg, sequence):
-        sequence += len(msg["data"])
-        response = msg["data"]
-        for packet in window:
-            if packet["seq"] == sequence: 
-                sequence += len(packet["data"])
-                response += packet["data"]
-        print(response, end='', flush=True)
-        return sequence
-            
+                # FIX: cumulative ACK
+                self.send({ "type": "ack", "seq": sequence })
 
 
 if __name__ == "__main__":
