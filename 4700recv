@@ -1,14 +1,21 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math, hashlib
+import argparse
+import socket
+import json
+import select
+import sys
+import hashlib
+
 
 def checksum(data):
     return hashlib.md5(data.encode()).hexdigest()
 
+
 class Receiver:
     def __init__(self):
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.bind(('0.0.0.0', 0))
+        self.socket.bind(("0.0.0.0", 0))
         self.port = self.socket.getsockname()[1]
         self.log("Bound to port %d" % self.port)
 
@@ -16,11 +23,16 @@ class Receiver:
         self.remote_port = None
 
     def send(self, message):
+        if self.remote_host is None or self.remote_port is None:
+            return
         self.log("Sent message %s" % json.dumps(message))
-        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.remote_host, self.remote_port))
+        self.socket.sendto(
+            json.dumps(message).encode("utf-8"),
+            (self.remote_host, self.remote_port)
+        )
 
-    def recv(self, socket):
-        data, addr = socket.recvfrom(65535)
+    def recv(self, sock):
+        data, addr = sock.recvfrom(65535)
 
         if self.remote_host is None:
             self.remote_host = addr[0]
@@ -30,10 +42,9 @@ class Receiver:
             self.log("Error: Received response from unexpected remote; ignoring")
             return None
 
-        # FIX: safe JSON parsing
         try:
             msg = json.loads(data.decode("utf-8"))
-        except:
+        except Exception:
             self.log("Corrupted JSON → dropping")
             return None
 
@@ -45,26 +56,37 @@ class Receiver:
         sys.stderr.flush()
 
     def run(self):
-        sequence = 0              # next expected byte
-        buffer = {}              # seq -> packet data
+        sequence = 0
+        buffer = {}
 
         while True:
-            socks = select.select([self.socket], [], [])[0]
-            for conn in socks:
+            readable = select.select([self.socket], [], [])[0]
+
+            for conn in readable:
                 msg = self.recv(conn)
 
-                if not msg or msg.get("type") != "msg":
+                if not isinstance(msg, dict):
+                    continue
+
+                if msg.get("type") != "msg":
+                    continue
+
+                if "seq" not in msg or "data" not in msg or "checksum" not in msg:
+                    self.log("Malformed packet → dropping")
                     continue
 
                 seq = msg["seq"]
                 data = msg["data"]
+                pkt_checksum = msg["checksum"]
 
-                # FIX: checksum validation
-                if "checksum" not in msg or checksum(data) != msg["checksum"]:
+                if not isinstance(seq, int) or not isinstance(data, str) or not isinstance(pkt_checksum, str):
+                    self.log("Malformed packet → dropping")
+                    continue
+
+                if checksum(data) != pkt_checksum:
                     self.log("Corrupted packet → dropping")
                     continue
 
-                # FIX: duplicate packet
                 if seq < sequence:
                     self.send({
                         "type": "ack",
@@ -73,18 +95,15 @@ class Receiver:
                     })
                     continue
 
-                # FIX: store packet if new
                 if seq not in buffer:
                     buffer[seq] = data
 
-                # FIX: deliver in-order data
                 while sequence in buffer:
                     payload = buffer[sequence]
-                    print(payload, end='', flush=True)
+                    print(payload, end="", flush=True)
                     del buffer[sequence]
                     sequence += len(payload)
 
-                # FIX: cumulative ACK
                 self.send({
                     "type": "ack",
                     "seq": sequence,
@@ -93,7 +112,7 @@ class Receiver:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='receive data')
+    parser = argparse.ArgumentParser(description="receive data")
     args = parser.parse_args()
-    sender = Receiver()
-    sender.run()
+    receiver = Receiver()
+    receiver.run()
