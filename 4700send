@@ -1,17 +1,11 @@
 #!/usr/bin/env -S python3 -u
 
-import socket
-import time
-import json
-import sys
-import hashlib
+import socket, time, json, sys, hashlib
 
 CHUNK_SIZE = 1000
 
-
 def checksum(data):
     return hashlib.md5(data.encode()).hexdigest()
-
 
 class Sender:
     def __init__(self, host, port):
@@ -20,13 +14,13 @@ class Sender:
         self.addr = (host, int(port))
 
     def send(self, msg):
-        self.sock.sendto(json.dumps(msg).encode("utf-8"), self.addr)
+        self.sock.sendto(json.dumps(msg).encode(), self.addr)
 
     def recv(self):
         try:
             data, _ = self.sock.recvfrom(65535)
-            return json.loads(data.decode("utf-8"))
-        except Exception:
+            return json.loads(data.decode())
+        except:
             return None
 
     def run(self):
@@ -35,28 +29,23 @@ class Sender:
         chunks = []
         i = 0
         while i < len(data):
-            chunks.append(data[i:i + CHUNK_SIZE])
+            chunks.append(data[i:i+CHUNK_SIZE])
             i += CHUNK_SIZE
 
-        total_data = len(data)
-
-        # seq -> packet / send time
         send_buffer = {}
         send_time = {}
 
         base = 0
         next_seq = 0
+        window_size = 5   # slightly bigger than before
+        timeout = 0.4     # key: better for jitter
 
-        # TCP Tahoe style congestion control
-        cwnd = 1.0           # congestion window in packets
-        ssthresh = 8.0
-        timeout = 0.35
+        total_data = len(data)
 
         while True:
-            window_packets = max(1, int(cwnd))
 
-            # fill window
-            while len(send_buffer) < window_packets and next_seq < total_data:
+            # Send within window
+            while (next_seq - base) < window_size * CHUNK_SIZE and next_seq < total_data:
                 chunk_index = next_seq // CHUNK_SIZE
                 payload = chunks[chunk_index]
 
@@ -70,53 +59,35 @@ class Sender:
                 self.send(pkt)
                 send_buffer[next_seq] = pkt
                 send_time[next_seq] = time.time()
+
                 next_seq += len(payload)
 
-            # process at most one ACK per loop
+            # Receive ACK
             msg = self.recv()
-            if isinstance(msg, dict):
-                if (
-                    msg.get("type") == "ack"
-                    and "seq" in msg
-                    and "checksum" in msg
-                    and isinstance(msg["seq"], int)
-                    and isinstance(msg["checksum"], str)
-                ):
+            if msg and msg.get("type") == "ack":
+                if "seq" in msg and "checksum" in msg:
                     ack = msg["seq"]
 
-                    # valid ACK checksum?
+                    # validate ACK
                     if checksum(str(ack)) == msg["checksum"]:
-                        # ACK must be in sane range
                         if base <= ack <= next_seq:
-                            if ack > base:
-                                # remove all acknowledged packets
-                                for s in list(send_buffer.keys()):
-                                    if s < ack:
-                                        del send_buffer[s]
-                                        del send_time[s]
+                            # remove acknowledged packets
+                            for s in list(send_buffer):
+                                if s < ack:
+                                    del send_buffer[s]
+                                    del send_time[s]
 
-                                base = ack
+                            base = ack
 
-                                # slow start / congestion avoidance
-                                if cwnd < ssthresh:
-                                    cwnd += 1.0
-                                else:
-                                    cwnd += 1.0 / cwnd
+            # Retransmit ALL timed-out packets (IMPORTANT)
+            now = time.time()
+            for s in list(send_buffer):
+                if now - send_time[s] > timeout:
+                    self.send(send_buffer[s])
+                    send_time[s] = now
 
-            # done?
             if base >= total_data:
                 break
-
-            # timeout: retransmit oldest unacked only
-            if send_buffer:
-                oldest_seq = min(send_buffer.keys())
-                if time.time() - send_time[oldest_seq] >= timeout:
-                    self.send(send_buffer[oldest_seq])
-                    send_time[oldest_seq] = time.time()
-
-                    # Tahoe backoff
-                    ssthresh = max(2.0, cwnd / 2.0)
-                    cwnd = 1.0
 
 
 if __name__ == "__main__":
