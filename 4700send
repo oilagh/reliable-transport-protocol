@@ -1,16 +1,20 @@
 #!/usr/bin/env -S python3 -u
 
-import socket, time, json, sys, hashlib
+import select, socket, time, json, sys, hashlib
 
 CHUNK_SIZE = 1000
+MIN_TIMEOUT = 0.1
+MAX_TIMEOUT = 8.0
+
 
 def checksum(data):
     return hashlib.md5(data.encode()).hexdigest()
 
+
 class Sender:
     def __init__(self, host, port):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.05)
+        self.sock.setblocking(False)
         self.addr = (host, int(port))
 
     def send(self, msg):
@@ -29,62 +33,94 @@ class Sender:
         chunks = []
         i = 0
         while i < len(data):
-            chunks.append(data[i:i+CHUNK_SIZE])
+            chunks.append(data[i : i + CHUNK_SIZE])
             i += CHUNK_SIZE
 
+        total_data = len(data)
         send_buffer = {}
         send_time = {}
-
+        retransmitted = set()
         base = 0
         next_seq = 0
-        window_size = 5   # slightly bigger than before
-        timeout = 0.4     # key: better for jitter
+        srtt = None
+        rttvar = None
+        timeout = 2.0
 
-        total_data = len(data)
+        cwnd = 2.0
+        ssthresh = 16.0
 
         while True:
-
-            # Send within window
-            while (next_seq - base) < window_size * CHUNK_SIZE and next_seq < total_data:
+            while (next_seq - base) < int(cwnd) * CHUNK_SIZE and next_seq < total_data:
                 chunk_index = next_seq // CHUNK_SIZE
                 payload = chunks[chunk_index]
-
                 pkt = {
                     "type": "msg",
                     "seq": next_seq,
                     "data": payload,
-                    "checksum": checksum(payload)
+                    "checksum": checksum(payload),
                 }
-
                 self.send(pkt)
                 send_buffer[next_seq] = pkt
                 send_time[next_seq] = time.time()
-
                 next_seq += len(payload)
 
-            # Receive ACK
-            msg = self.recv()
-            if msg and msg.get("type") == "ack":
-                if "seq" in msg and "checksum" in msg:
+            now = time.time()
+            if send_time:
+                wait = max(0.0, min(send_time[s] + timeout - now for s in send_time))
+            else:
+                wait = timeout
+
+            readable, _, _ = select.select([self.sock], [], [], wait)
+
+            if readable:
+                msg = self.recv()
+                if (
+                    msg
+                    and msg.get("type") == "ack"
+                    and "seq" in msg
+                    and "checksum" in msg
+                ):
                     ack = msg["seq"]
 
-                    # validate ACK
                     if checksum(str(ack)) == msg["checksum"]:
-                        if base <= ack <= next_seq:
-                            # remove acknowledged packets
+                        if base < ack <= next_seq:
+                            for s in sorted(send_buffer):
+                                if s < ack and s not in retransmitted:
+                                    sample = time.time() - send_time[s]
+                                    if srtt is None:
+                                        srtt = sample
+                                        rttvar = sample / 2.0
+                                    else:
+                                        rttvar = 0.75 * rttvar + 0.25 * abs(
+                                            sample - srtt
+                                        )
+                                        srtt = 0.875 * srtt + 0.125 * sample
+                                    timeout = max(
+                                        MIN_TIMEOUT, min(MAX_TIMEOUT, srtt + 4 * rttvar)
+                                    )
+                                    break
+
+                            if cwnd < ssthresh:
+                                cwnd += 1.0
+                            else:
+                                cwnd += 1.0 / cwnd
+
                             for s in list(send_buffer):
                                 if s < ack:
                                     del send_buffer[s]
                                     del send_time[s]
-
+                                    retransmitted.discard(s)
                             base = ack
 
-            # Retransmit ALL timed-out packets (IMPORTANT)
             now = time.time()
-            for s in list(send_buffer):
-                if now - send_time[s] > timeout:
+            timed_out = [s for s in send_buffer if now - send_time[s] > timeout]
+            if timed_out:
+                ssthresh = max(2.0, cwnd / 2.0)
+                cwnd = 1.0
+                for s in sorted(timed_out):
                     self.send(send_buffer[s])
                     send_time[s] = now
+                    retransmitted.add(s)
 
             if base >= total_data:
                 break
